@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Environment / secrets (better-auth secret, DB URLs, etc.)
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Build / coverage output
+dist/
+build/
+coverage/
+
+# Local databases
+*.sqlite
+*.db
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
