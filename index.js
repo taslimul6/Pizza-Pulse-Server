@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { MongoClient, ObjectId } from "mongodb";
+import { createAuth } from "./src/middleware/auth.js";
 
 dotenv.config();
 
@@ -29,6 +30,12 @@ const db = client.db("pizzaPulse");
 const collection = db.collection("menuItems");
 const orders = db.collection("orders");
 const users = db.collection("user"); // Better Auth users
+
+// JWT checks for the protected routes (see src/middleware/auth.js)
+//   authenticate         : the request must carry a valid, unexpired token
+//   requireRole("vendor"): the user must also have that role
+// After authenticate, req.user is the logged-in user (from the database).
+const { authenticate, requireRole } = createAuth(users);
 
 // Connect, then add indexes so the lists load fast
 connectToMongoDB().then(async () => {
@@ -70,6 +77,8 @@ const toSlug = (text) => String(text).toLowerCase().trim().replace(/\s+/g, "-");
 
 //apis
 
+// ---- Public (no token needed) ----
+
 // Customers only see approved items
 const publicItems = { status: "approved" };
 
@@ -92,23 +101,19 @@ app.get("/featured", async (req, res) => {
 });
 
 
-// ---- Orders ----
+// ---- Orders (token needed) ----
 
-// Save a new order: { customerId, name, email, orderDetails }
-// orderDetails holds the item information, delivery details and the status.
-// vendorId is looked up from the ordered item.
-app.post("/orders", async (req, res) => {
-  const { customerId, name, email, orderDetails } = req.body;
+// Save a new order: { orderDetails }
+// The customer comes from the token. vendorId is looked up from the ordered item.
+app.post("/orders", authenticate, async (req, res) => {
+  const { orderDetails } = req.body;
 
-  if (!name || !email || !isId(customerId)) {
-    return res.status(400).json({ error: "customerId, name and email are required" });
-  }
   if (!isId(orderDetails?.itemId)) {
     return res.status(400).json({ error: "orderDetails.itemId is required" });
   }
 
   // Find the ordered item to get the vendor
-  const item = await collection.findOne({ _id: new ObjectId(orderDetails.itemId) });
+  const item = await collection.findOne({ _id: new ObjectId(orderDetails.itemId), ...publicItems });
   if (!item) {
     return res.status(404).json({ error: "Item not found" });
   }
@@ -116,10 +121,10 @@ app.post("/orders", async (req, res) => {
   const vendorUser = item.vendorId ? await users.findOne({ _id: item.vendorId }) : null;
 
   const result = await orders.insertOne({
-    customerId: new ObjectId(customerId),
+    customerId: req.user._id,
     vendorId: item.vendorId ?? null,
-    name,
-    email,
+    name: req.user.name,
+    email: req.user.email,
     vendor: {
       name: vendorUser?.businessName || vendorUser?.name || titleCase(item.shop),
       shop: item.shop ?? null,
@@ -135,39 +140,31 @@ app.post("/orders", async (req, res) => {
   res.status(201).json({ orderId: result.insertedId });
 });
 
-// All orders, newest first
-app.get("/orders", async (req, res) => {
+// All orders, newest first (admin only)
+app.get("/orders", authenticate, requireRole("admin"), async (req, res) => {
   const list = await orders.find().sort({ createdAt: -1 }).toArray();
   res.json(list);
 });
 
-// Orders of one customer, newest first: GET /orders/customer?customerId=...
-app.get("/orders/customer", async (req, res) => {
-  const { customerId } = req.query;
-  if (!isId(customerId)) {
-    return res.status(400).json({ error: "customerId is required" });
-  }
+// Orders of the logged-in customer, newest first
+app.get("/orders/customer", authenticate, async (req, res) => {
   const list = await orders
-    .find({ customerId: new ObjectId(customerId) })
+    .find({ customerId: req.user._id })
     .sort({ createdAt: -1 })
     .toArray();
   res.json(list);
 });
 
-// Orders of one vendor, newest first: GET /orders/vendor?vendorId=...
-app.get("/orders/vendor", async (req, res) => {
-  const { vendorId } = req.query;
-  if (!isId(vendorId)) {
-    return res.status(400).json({ error: "vendorId is required" });
-  }
+// Orders of the logged-in vendor, newest first
+app.get("/orders/vendor", authenticate, requireRole("vendor"), async (req, res) => {
   const list = await orders
-    .find({ vendorId: new ObjectId(vendorId) })
+    .find({ vendorId: req.user._id })
     .sort({ createdAt: -1 })
     .toArray();
   res.json(list);
 });
 
-// Vendor moves an order forward: PATCH /orders/:id/status  { vendorId, action }
+// Vendor moves an order forward: PATCH /orders/:id/status  { action }
 //   accept   : pending  -> accepted
 //   reject   : pending  -> rejected
 //   complete : accepted -> completed
@@ -178,19 +175,19 @@ const orderSteps = {
   complete: { from: "accepted", to: "completed" },
 };
 
-app.patch("/orders/:id/status", async (req, res) => {
+app.patch("/orders/:id/status", authenticate, requireRole("vendor"), async (req, res) => {
   const { id } = req.params;
-  const { vendorId, action } = req.body;
+  const { action } = req.body;
   const step = orderSteps[action];
 
   if (!isId(id)) {
     return res.status(400).json({ error: "Invalid order id" });
   }
-  if (!isId(vendorId) || !step) {
-    return res.status(400).json({ error: "vendorId and a valid action are required" });
+  if (!step) {
+    return res.status(400).json({ error: "A valid action is required" });
   }
 
-  const owner = { _id: new ObjectId(id), vendorId: new ObjectId(vendorId) };
+  const owner = { _id: new ObjectId(id), vendorId: req.user._id };
 
   // The status is part of the filter, so a second click changes nothing
   const result = await orders.updateOne(
@@ -211,19 +208,18 @@ app.patch("/orders/:id/status", async (req, res) => {
   });
 });
 
-// Customer cancels a pending order: PATCH /orders/:id/cancel  { customerId }
+// Customer cancels a pending order: PATCH /orders/:id/cancel
 // The order stays in the collection with the status "cancelled".
-app.patch("/orders/:id/cancel", async (req, res) => {
+app.patch("/orders/:id/cancel", authenticate, async (req, res) => {
   const { id } = req.params;
-  const { customerId } = req.body;
 
-  if (!isId(id) || !isId(customerId)) {
-    return res.status(400).json({ error: "Invalid order id or customerId" });
+  if (!isId(id)) {
+    return res.status(400).json({ error: "Invalid order id" });
   }
 
   // Only the customer's own order, and only while it is still pending
   const result = await orders.updateOne(
-    { _id: new ObjectId(id), customerId: new ObjectId(customerId), "orderDetails.status": "pending" },
+    { _id: new ObjectId(id), customerId: req.user._id, "orderDetails.status": "pending" },
     { $set: { "orderDetails.status": "cancelled", updatedAt: new Date() } }
   );
 
@@ -234,30 +230,30 @@ app.patch("/orders/:id/cancel", async (req, res) => {
 });
 
 
-// ---- Vendor menu ----
+// ---- Vendor menu (vendor token needed) ----
 
 // Vendor adds a menu item:
-// { vendorId, vendorName, itemName, category, description, price, location, image }
+// { itemName, category, description, price, location, image }
 // It is saved with status "pending" until an admin approves it.
-app.post("/menu", async (req, res) => {
-  const { vendorId, vendorName, itemName, category, description, price, location, image } = req.body;
+app.post("/menu", authenticate, requireRole("vendor"), async (req, res) => {
+  const { itemName, category, description, price, location, image } = req.body;
 
   const cleanPrice = Number(price);
   if (
-    !isId(vendorId) || !itemName || !category || !description || !location || !image ||
+    !itemName || !category || !description || !location || !image ||
     !Number.isFinite(cleanPrice) || cleanPrice <= 0
   ) {
     return res.status(400).json({ error: "All fields are required" });
   }
 
   const result = await collection.insertOne({
-    vendorId: new ObjectId(vendorId),
+    vendorId: req.user._id,
     itemName,
     slug: toSlug(itemName),
     description,
     category,
     emoji: "🍕",
-    shop: toSlug(vendorName || "vendor"),
+    shop: toSlug(req.user.businessName || req.user.name || "vendor"),
     location,
     price: cleanPrice,
     sizes: [{ label: "Regular", price: cleanPrice }],
@@ -275,35 +271,28 @@ app.post("/menu", async (req, res) => {
   res.status(201).json({ itemId: result.insertedId, status: "pending" });
 });
 
-// Get all items of one vendor (any status): GET /menu/mine?vendorId=...
-app.get("/menu/mine", async (req, res) => {
-  const { vendorId } = req.query;
-
-  // Without a vendorId the filter would match items that have no vendor
-  if (!isId(vendorId)) {
-    return res.status(400).json({ error: "vendorId is required" });
-  }
-
+// All items of the logged-in vendor (any status)
+app.get("/menu/mine", authenticate, requireRole("vendor"), async (req, res) => {
   const items = await collection
-    .find({ vendorId: new ObjectId(vendorId) })
+    .find({ vendorId: req.user._id })
     .sort({ createdAt: -1 })
     .toArray();
   res.json(items);
 });
 
 // Vendor switches an item on (approved) or off (inactive)
-// PATCH /menu/:id   body: { vendorId, active: true | false }
+// PATCH /menu/:id   body: { active: true | false }
 // Pending and rejected items cannot be switched.
-app.patch("/menu/:id", async (req, res) => {
+app.patch("/menu/:id", authenticate, requireRole("vendor"), async (req, res) => {
   const { id } = req.params;
-  const { vendorId, active } = req.body;
+  const { active } = req.body;
 
-  if (!isId(id) || !isId(vendorId) || typeof active !== "boolean") {
-    return res.status(400).json({ error: "id, vendorId and active are required" });
+  if (!isId(id) || typeof active !== "boolean") {
+    return res.status(400).json({ error: "id and active are required" });
   }
 
   const result = await collection.updateOne(
-    { _id: new ObjectId(id), vendorId: new ObjectId(vendorId), status: active ? "inactive" : "approved" },
+    { _id: new ObjectId(id), vendorId: req.user._id, status: active ? "inactive" : "approved" },
     { $set: { status: active ? "approved" : "inactive" } }
   );
 
@@ -314,15 +303,15 @@ app.patch("/menu/:id", async (req, res) => {
 });
 
 // Vendor edits an item. It goes back to "pending" so the admin can approve it again.
-// PUT /menu/:id   body: { vendorId, itemName, category, description, price, location, image }
+// PUT /menu/:id   body: { itemName, category, description, price, location, image }
 // image is optional (the old images stay if it is not sent)
-app.put("/menu/:id", async (req, res) => {
+app.put("/menu/:id", authenticate, requireRole("vendor"), async (req, res) => {
   const { id } = req.params;
-  const { vendorId, itemName, category, description, price, location, image } = req.body;
+  const { itemName, category, description, price, location, image } = req.body;
 
   const cleanPrice = Number(price);
   if (
-    !isId(id) || !isId(vendorId) || !itemName || !category || !description || !location ||
+    !isId(id) || !itemName || !category || !description || !location ||
     !Number.isFinite(cleanPrice) || cleanPrice <= 0
   ) {
     return res.status(400).json({ error: "All fields are required" });
@@ -342,7 +331,7 @@ app.put("/menu/:id", async (req, res) => {
 
   // Only the owner can edit
   const result = await collection.updateOne(
-    { _id: new ObjectId(id), vendorId: new ObjectId(vendorId) },
+    { _id: new ObjectId(id), vendorId: req.user._id },
     { $set: changes }
   );
 
@@ -352,19 +341,18 @@ app.put("/menu/:id", async (req, res) => {
   res.json({ message: "Item updated", status: "pending" });
 });
 
-// Vendor deletes an item: DELETE /menu/:id?vendorId=...
-app.delete("/menu/:id", async (req, res) => {
+// Vendor deletes an item: DELETE /menu/:id
+app.delete("/menu/:id", authenticate, requireRole("vendor"), async (req, res) => {
   const { id } = req.params;
-  const { vendorId } = req.query;
 
-  if (!isId(id) || !isId(vendorId)) {
-    return res.status(400).json({ error: "id and vendorId are required" });
+  if (!isId(id)) {
+    return res.status(400).json({ error: "Invalid item id" });
   }
 
   // Only the owner can delete
   const result = await collection.deleteOne({
     _id: new ObjectId(id),
-    vendorId: new ObjectId(vendorId),
+    vendorId: req.user._id,
   });
 
   if (result.deletedCount === 0) {
@@ -374,11 +362,11 @@ app.delete("/menu/:id", async (req, res) => {
 });
 
 
-// ---- Admin ----
+// ---- Admin (admin token needed) ----
 
 // All items with every status, with the vendor's name and email
 // GET /admin/menu
-app.get("/admin/menu", async (req, res) => {
+app.get("/admin/menu", authenticate, requireRole("admin"), async (req, res) => {
   const items = await collection
     .aggregate([
       { $sort: { createdAt: -1 } },
@@ -403,7 +391,7 @@ app.get("/admin/menu", async (req, res) => {
 //   inactive = switched off, hidden
 const itemStatuses = ["pending", "approved", "rejected", "inactive"];
 
-app.patch("/admin/menu/:id/status", async (req, res) => {
+app.patch("/admin/menu/:id/status", authenticate, requireRole("admin"), async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
 
@@ -427,7 +415,7 @@ app.patch("/admin/menu/:id/status", async (req, res) => {
 
 // Admin deletes any item
 // DELETE /admin/menu/:id
-app.delete("/admin/menu/:id", async (req, res) => {
+app.delete("/admin/menu/:id", authenticate, requireRole("admin"), async (req, res) => {
   const { id } = req.params;
   if (!isId(id)) {
     return res.status(400).json({ error: "Invalid item id" });
@@ -442,7 +430,7 @@ app.delete("/admin/menu/:id", async (req, res) => {
 
 // All registered users (Better Auth "user" collection, no passwords)
 // GET /users
-app.get("/users", async (req, res) => {
+app.get("/users", authenticate, requireRole("admin"), async (req, res) => {
   const list = await users
     .find({}, { projection: { name: 1, email: 1, image: 1, role: 1, isBlocked: 1, businessName: 1, subscriptionPlan: 1, subscriptionExpiresAt: 1, emailVerified: 1, createdAt: 1 } })
     .sort({ createdAt: -1 })
@@ -452,7 +440,7 @@ app.get("/users", async (req, res) => {
 
 // Block or unblock a user (admins are never blocked)
 // PATCH /users/:id/block   body: { isBlocked: true | false }
-app.patch("/users/:id/block", async (req, res) => {
+app.patch("/users/:id/block", authenticate, requireRole("admin"), async (req, res) => {
   const { id } = req.params;
   const { isBlocked } = req.body;
 
@@ -478,7 +466,7 @@ app.patch("/users/:id/block", async (req, res) => {
 
 // Numbers for the admin dashboard
 // GET /stats
-app.get("/stats", async (req, res) => {
+app.get("/stats", authenticate, requireRole("admin"), async (req, res) => {
   res.json({
     users: await users.countDocuments(),
     vendors: await users.countDocuments({ role: "vendor" }),
@@ -499,7 +487,7 @@ const paymentStatusOf = {
   cancelled: "refunded",
 };
 
-app.get("/admin/transactions", async (req, res) => {
+app.get("/admin/transactions", authenticate, requireRole("admin"), async (req, res) => {
   const list = await orders
     .aggregate([
       { $sort: { createdAt: -1 } },
