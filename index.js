@@ -28,6 +28,7 @@ export async function connectToMongoDB() {
 connectToMongoDB();
 const db = client.db("pizzaPulse");
 const collection = db.collection("pizza");
+const orders = db.collection("orders");
 
 
 
@@ -51,10 +52,30 @@ app.get("/featured", async (req, res) => {
   res.json(pizzas);
 });
 
+// Save a new order: { name, email, orderDetails }
+app.post("/orders", async (req, res) => {
+  const { name, email, orderDetails } = req.body;
 
+  // name and email are required
+  if (!name || !email) {
+    return res.status(400).json({ error: "name and email are required" });
+  }
+
+  const result = await orders.insertOne({
+    name,
+    email,
+    orderDetails,
+    createdAt: new Date(),
+  });
+  res.status(201).json({ orderId: result.insertedId });
+});
+
+// All orders, newest first
+app.get("/orders", async (req, res) => {
+  const list = await orders.find().sort({ createdAt: -1 }).toArray();
+  res.json(list);
+});
 
 app.listen(PORT, () => {
   console.log("server is running at " + PORT);
 });
-
-
