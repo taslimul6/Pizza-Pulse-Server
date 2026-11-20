@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 
 dotenv.config();
 
@@ -74,6 +74,33 @@ app.post("/orders", async (req, res) => {
 app.get("/orders", async (req, res) => {
   const list = await orders.find().sort({ createdAt: -1 }).toArray();
   res.json(list);
+});
+
+//
+
+// Cancel (delete) a pending order: DELETE /orders/:id?email=customer@email.com
+app.delete("/orders/:id", async (req, res) => {
+  const { id } = req.params;
+  const { email } = req.query;
+
+  if (id.length !== 24 || !ObjectId.isValid(id)) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  if (!email) {
+    return res.status(400).json({ error: "email is required" });
+  }
+
+  // Delete only if it belongs to this email AND is still pending
+  const result = await orders.deleteOne({
+    _id: new ObjectId(id),
+    email,
+    "orderDetails.status": "pending",
+  });
+
+  if (result.deletedCount === 0) {
+    return res.status(404).json({ error: "Pending order not found" });
+  }
+  res.json({ message: "Order cancelled" });
 });
 
 app.listen(PORT, () => {
