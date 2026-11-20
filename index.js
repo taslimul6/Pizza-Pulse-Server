@@ -386,6 +386,35 @@ app.get("/stats", async (req, res) => {
   });
 });
 
+// Transactions for the admin. READ ONLY: there is no route that changes one.
+
+const paymentStatusOf = {
+  pending: "pending",
+  "in process": "paid",
+  completed: "paid",
+  rejected: "refunded",
+};
+
+app.get("/admin/transactions", async (req, res) => {
+  const list = await orders.find().sort({ createdAt: -1 }).toArray();
+
+  const transactions = list.map((order) => {
+    const d = order.orderDetails || {};
+    return {
+      _id: order._id,
+      vendor: order.vendor || null,
+      customer: order.customer || { name: order.name, email: order.email },
+      itemName: d.itemName,
+      amount: d.total,
+      cardLast4: d.cardLast4,
+      orderStatus: d.status,
+      paymentStatus: paymentStatusOf[d.status] || "pending",
+      createdAt: order.createdAt,
+    };
+  });
+  res.json(transactions);
+});
+
 // Add new APIs above this line (keep app.listen last)
 
 app.listen(PORT, () => {
