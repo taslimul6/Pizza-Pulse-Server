@@ -150,7 +150,7 @@ app.patch("/orders/:id/status", async (req, res) => {
   const { email, action } = req.body;
   const step = orderSteps[action];
 
-  if (!isValidId(id)) {
+  if (id.length !== 24 || !ObjectId.isValid(id)) {
     return res.status(400).json({ error: "Invalid order id" });
   }
   if (!email || !step) {
@@ -246,14 +246,12 @@ app.post("/menu", async (req, res) => {
   res.status(201).json({ itemId: result.insertedId, status: "pending" });
 });
 
-// Is this a valid MongoDB id? (24 characters)
-const isValidId = (id) => id.length === 24 && ObjectId.isValid(id);
-
 // Get all items of one vendor (any status)
 // GET /menu/mine?email=vendor@email.com
 app.get("/menu/mine", async (req, res) => {
   const { email } = req.query;
 
+  // Without an email the filter would match items that have no vendor
   if (!email) {
     return res.status(400).json({ error: "email is required" });
   }
@@ -262,91 +260,130 @@ app.get("/menu/mine", async (req, res) => {
   res.json(items);
 });
 
-// Vendor turns an item on/off (only for published items)
+// Vendor turns a published item on/off
 // PATCH /menu/:id   body: { email, available }
 app.patch("/menu/:id", async (req, res) => {
-  const { id } = req.params;
   const { email, available } = req.body;
 
-  if (!isValidId(id)) {
-    return res.status(400).json({ error: "Invalid item id" });
-  }
-  if (!email || typeof available !== "boolean") {
-    return res.status(400).json({ error: "email and available are required" });
-  }
-
-  // The item must belong to this vendor and be published
-  const result = await collection.updateOne(
-    { _id: new ObjectId(id), "vendor.email": email, status: "publish" },
+  // Only the owner can change it, and only if it is published
+  await collection.updateOne(
+    { _id: new ObjectId(req.params.id), "vendor.email": email, status: "publish" },
     { $set: { available } }
   );
-
-  if (result.matchedCount === 0) {
-    return res.status(404).json({ error: "Published item not found" });
-  }
   res.json({ message: "Item updated" });
 });
 
-// Vendor edits an item. It goes back to "pending" so the admin can approve the changes.
+// Vendor edits an item. It goes back to "pending" so the admin can approve it again.
 // PUT /menu/:id   body: { email, name, category, description, price, location, image }
 // image is optional (the old image stays if it is not sent)
 app.put("/menu/:id", async (req, res) => {
-  const { id } = req.params;
   const { email, name, category, description, price, location, image } = req.body;
-
-  const cleanPrice = Number(price);
-
-  if (!isValidId(id)) {
-    return res.status(400).json({ error: "Invalid item id" });
-  }
-  if (!email || !name || !category || !description || !location || !(cleanPrice > 0)) {
-    return res.status(400).json({ error: "All fields are required" });
-  }
 
   const changes = {
     name,
     category,
     description,
     location,
-    price: cleanPrice,
-    sizes: [{ label: "Regular", price: cleanPrice }],
+    price: Number(price),
+    sizes: [{ label: "Regular", price: Number(price) }],
     status: "pending",
     updatedAt: new Date(),
   };
   if (image) changes.image = image;
 
-  // The item must belong to this vendor
-  const result = await collection.updateOne(
-    { _id: new ObjectId(id), "vendor.email": email },
+  // Only the owner can edit
+  await collection.updateOne(
+    { _id: new ObjectId(req.params.id), "vendor.email": email },
     { $set: changes }
   );
-
-  if (result.matchedCount === 0) {
-    return res.status(404).json({ error: "Item not found" });
-  }
   res.json({ message: "Item updated", status: "pending" });
 });
 
 // Vendor deletes an item
 // DELETE /menu/:id?email=vendor@email.com
 app.delete("/menu/:id", async (req, res) => {
-  const { id } = req.params;
-  const { email } = req.query;
-
-  if (!isValidId(id)) {
-    return res.status(400).json({ error: "Invalid item id" });
-  }
-  if (!email) {
-    return res.status(400).json({ error: "email is required" });
-  }
-
-  // The item must belong to this vendor
-  const result = await collection.deleteOne({ _id: new ObjectId(id), "vendor.email": email });
-
-  if (result.deletedCount === 0) {
-    return res.status(404).json({ error: "Item not found" });
-  }
+  // Only the owner can delete
+  await collection.deleteOne({ _id: new ObjectId(req.params.id), "vendor.email": req.query.email });
   res.json({ message: "Item deleted" });
+});
+
+// ---- Admin ----
+
+// All items with every status (customers only see published ones)
+// GET /admin/menu
+app.get("/admin/menu", async (req, res) => {
+  const items = await collection.find().sort({ createdAt: -1 }).toArray();
+  res.json(items);
+});
+
+// Approve / reject an item
+// PATCH /admin/menu/:id/status   body: { status }
+//   publish  = approved, shown on the public menu
+//   pending  = waiting for review, hidden
+//   rejected = hidden
+app.patch("/admin/menu/:id/status", async (req, res) => {
+  const { status } = req.body;
+
+  // Any other status would make the item visible to customers
+  if (!["publish", "pending", "rejected"].includes(status)) {
+    return res.status(400).json({ error: "status must be publish, pending or rejected" });
+  }
+
+  await collection.updateOne(
+    { _id: new ObjectId(req.params.id) },
+    { $set: { status, reviewedAt: new Date() } }
+  );
+  res.json({ message: "Status updated", status });
+});
+
+// Admin deletes any item
+// DELETE /admin/menu/:id
+app.delete("/admin/menu/:id", async (req, res) => {
+  await collection.deleteOne({ _id: new ObjectId(req.params.id) });
+  res.json({ message: "Item deleted" });
+});
+
+// All registered users (Better Auth "user" collection, no passwords)
+// GET /users
+app.get("/users", async (req, res) => {
+  const list = await db
+    .collection("user")
+    .find({}, { projection: { name: 1, email: 1, role: 1, blocked: 1, emailVerified: 1, image: 1, createdAt: 1 } })
+    .sort({ createdAt: -1 })
+    .toArray();
+  res.json(list);
+});
+
+// Block or unblock a user (admins are never blocked)
+// PATCH /users/:id/block   body: { blocked: true | false }
+app.patch("/users/:id/block", async (req, res) => {
+  const { blocked } = req.body;
+  const userId = new ObjectId(req.params.id);
+
+  await db
+    .collection("user")
+    .updateOne({ _id: userId, role: { $ne: "admin" } }, { $set: { blocked, updatedAt: new Date() } });
+
+  // A blocked user is logged out at once
+  if (blocked) {
+    await db.collection("session").deleteMany({ userId });
+  }
+  res.json({ message: blocked ? "User blocked" : "User unblocked", blocked });
+});
+
+// Numbers for the admin dashboard
+// GET /stats
+app.get("/stats", async (req, res) => {
+  const users = db.collection("user");
+
+  res.json({
+    users: await users.countDocuments(),
+    vendors: await users.countDocuments({ role: "vendor" }),
+    customers: await users.countDocuments({ role: "customer" }),
+    menuItems: await collection.countDocuments(),
+    pendingItems: await collection.countDocuments({ status: "pending" }),
+    transactions: await orders.countDocuments(),
+  });
 });
 
 // Add new APIs above this line (keep app.listen last)
