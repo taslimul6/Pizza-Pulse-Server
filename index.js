@@ -25,10 +25,20 @@ export async function connectToMongoDB() {
   }
 }
 
-connectToMongoDB();
 const db = client.db("pizzaPulse");
 const collection = db.collection("pizza");
+// The "orders" collection (MongoDB creates it on the first order)
 const orders = db.collection("orders");
+
+// Connect, then add indexes so "my orders" and the vendor's orders load fast
+connectToMongoDB().then(async () => {
+  try {
+    await orders.createIndex({ "customer.email": 1, createdAt: -1 });
+    await orders.createIndex({ "vendor.email": 1, createdAt: -1 });
+  } catch (err) {
+    console.dir(err);
+  }
+});
 
 
 
@@ -56,19 +66,48 @@ app.get("/featured", async (req, res) => {
   res.json(pizzas);
 });
 
-// Save a new order: { name, email, orderDetails }
-app.post("/orders", async (req, res) => {
-  const { name, email, orderDetails } = req.body;
+// "pizzahub-downtown" -> "Pizzahub Downtown"
+function titleCase(slug) {
+  return String(slug || "")
+    .split("-")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
 
-  // name and email are required
+// Save a new order: { name, email, customerId, orderDetails }
+// orderDetails holds the item information and the order status.
+// The vendor information is looked up from the ordered item in the pizza collection.
+app.post("/orders", async (req, res) => {
+  const { name, email, customerId, orderDetails } = req.body;
+
+  // name, email and the item are required
   if (!name || !email) {
     return res.status(400).json({ error: "name and email are required" });
   }
+  if (!orderDetails?.itemId) {
+    return res.status(400).json({ error: "orderDetails.itemId is required" });
+  }
+
+  // Find the ordered item to get the vendor information
+  const item = ObjectId.isValid(orderDetails.itemId) && orderDetails.itemId.length === 24
+    ? await collection.findOne({ _id: new ObjectId(orderDetails.itemId) })
+    : null;
+
+  const vendor = {
+    id: item?.vendor?.id ?? null,
+    name: item?.vendor?.name ?? titleCase(item?.shop ?? orderDetails.shop),
+    email: item?.vendor?.email ?? null,
+    shop: item?.shop ?? orderDetails.shop ?? null,
+    location: item?.location ?? null,
+  };
 
   const result = await orders.insertOne({
     name,
     email,
-    orderDetails,
+    customer: { id: customerId ?? null, name, email },
+    vendor,
+    orderDetails: { ...orderDetails, status: "pending" },
     createdAt: new Date(),
   });
   res.status(201).json({ orderId: result.insertedId });
@@ -81,6 +120,63 @@ app.get("/orders", async (req, res) => {
 });
 
 //
+
+// Orders of one vendor, newest first: GET /orders/vendor?email=vendor@email.com
+app.get("/orders/vendor", async (req, res) => {
+  const { email } = req.query;
+  if (!email) {
+    return res.status(400).json({ error: "email is required" });
+  }
+  const list = await orders
+    .find({ "vendor.email": email })
+    .sort({ createdAt: -1 })
+    .toArray();
+  res.json(list);
+});
+
+// Vendor moves an order forward: PATCH /orders/:id/status  { email, action }
+//   accept   : pending    -> in process
+//   reject   : pending    -> rejected
+//   complete : in process -> completed
+// Only the vendor who owns the order can do it, and each step works only once.
+const orderSteps = {
+  accept: { from: "pending", to: "in process" },
+  reject: { from: "pending", to: "rejected" },
+  complete: { from: "in process", to: "completed" },
+};
+
+app.patch("/orders/:id/status", async (req, res) => {
+  const { id } = req.params;
+  const { email, action } = req.body;
+  const step = orderSteps[action];
+
+  if (!isValidId(id)) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  if (!email || !step) {
+    return res.status(400).json({ error: "email and a valid action are required" });
+  }
+
+  const owner = { _id: new ObjectId(id), "vendor.email": email };
+
+  // The status is part of the filter, so a second click changes nothing
+  const result = await orders.updateOne(
+    { ...owner, "orderDetails.status": step.from },
+    { $set: { "orderDetails.status": step.to, updatedAt: new Date() } }
+  );
+  if (result.matchedCount === 1) {
+    return res.json({ message: "Order updated", status: step.to });
+  }
+
+  // Not changed: not the vendor's order, or it is not in the right status
+  const order = await orders.findOne(owner);
+  if (!order) {
+    return res.status(404).json({ error: "Order not found" });
+  }
+  res.status(409).json({
+    error: `Cannot ${action}: this order is ${order.orderDetails?.status}, it must be ${step.from}.`,
+  });
+});
 
 // Cancel (delete) a pending order: DELETE /orders/:id?email=customer@email.com
 app.delete("/orders/:id", async (req, res) => {
