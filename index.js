@@ -1,36 +1,60 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { MongoClient } from "mongodb";
 
 dotenv.config();
-
-
-
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(
-  cors({
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
-    credentials: true,
-  })
-);
+app.use(cors());
 app.use(express.json());
 
-app.get("/", (req, res) => {
-  res.json({ message: "Pizza Pulse API is running" });
-});
+// MongoDB connect
+const client = new MongoClient(process.env.MONGODB_URI);
 
 
-
-
-
-app.listen(PORT, (err) => {
-  // Express 5 passes listen errors (e.g. port in use / reserved) to this callback.
-  if (err) {
-    console.error(`Failed to start server on port ${PORT}:`, err.message);
-    process.exit(1);
+export async function connectToMongoDB() {
+  try {
+    await client.connect();
+    console.log("You successfully connected to MongoDB!");
+    return client;
+  } catch (err) {
+    console.dir(err);
   }
-  console.log(`Pizza Pulse server listening on http://localhost:${PORT}`);
+}
+
+connectToMongoDB();
+const db = client.db("pizzaPulse");
+const collection = db.collection("pizza");
+
+
+
+//apis
+
+app.get("/", async (req, res) => {
+  const pizzas = await collection.find().toArray();
+  res.json(pizzas);
 });
+
+
+// All unique categories from the pizza collection
+app.get("/category", async (req, res) => {
+  const categories = await collection.distinct("category");
+  res.json(categories);
+});
+
+// 6 featured pizzas (highest rated first)
+app.get("/featured", async (req, res) => {
+  const pizzas = await collection.find().sort({ rating: -1 }).limit(6).toArray();
+  res.json(pizzas);
+});
+
+
+
+app.listen(PORT, () => {
+  console.log("server is running at " + PORT);
+});
+
+
