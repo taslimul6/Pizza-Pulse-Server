@@ -26,45 +26,34 @@ export async function connectToMongoDB() {
 }
 
 const db = client.db("pizzaPulse");
-const collection = db.collection("pizza");
-// The "orders" collection (MongoDB creates it on the first order)
+const collection = db.collection("menuItems");
 const orders = db.collection("orders");
+const users = db.collection("user"); // Better Auth users
 
-// Connect, then add indexes so "my orders" and the vendor's orders load fast
+// Connect, then add indexes so the lists load fast
 connectToMongoDB().then(async () => {
   try {
-    await orders.createIndex({ "customer.email": 1, createdAt: -1 });
-    await orders.createIndex({ "vendor.email": 1, createdAt: -1 });
+    await orders.createIndex({ customerId: 1, createdAt: -1 });
+    await orders.createIndex({ vendorId: 1, createdAt: -1 });
+    await collection.createIndex({ vendorId: 1, createdAt: -1 });
   } catch (err) {
     console.dir(err);
   }
 });
 
+// ---- Keys used in the collections ----
+// users      : name, email, image, role, isBlocked, businessName,
+//              subscriptionPlan, subscriptionExpiresAt
+// menuItems  : vendorId, itemName, category, description, price, location,
+//              images, status, createdAt
+//              status = pending | approved | rejected | inactive
+// orders     : itemId, vendorId, customerId, deliveryDate, deliveryAddress,
+//              message, status, createdAt
+//              (itemId, deliveryDate, deliveryAddress, message and status are
+//               inside the orderDetails object)
+//              status = pending | accepted | rejected | cancelled | completed
 
-
-//apis
-
-// Customers only see published items. "pending" and "rejected" items are hidden.
-// Older items without a status field are still shown.
-const notPending = { status: { $nin: ["pending", "rejected"] } };
-
-app.get("/", async (req, res) => {
-  const pizzas = await collection.find(notPending).toArray();
-  res.json(pizzas);
-});
-
-
-// All unique categories from the pizza collection
-app.get("/category", async (req, res) => {
-  const categories = await collection.distinct("category", notPending);
-  res.json(categories);
-});
-
-// 6 featured pizzas (highest rated first)
-app.get("/featured", async (req, res) => {
-  const pizzas = await collection.find(notPending).sort({ rating: -1 }).limit(6).toArray();
-  res.json(pizzas);
-});
+const isId = (id) => typeof id === "string" && id.length === 24 && ObjectId.isValid(id);
 
 // "pizzahub-downtown" -> "Pizzahub Downtown"
 function titleCase(slug) {
@@ -75,39 +64,72 @@ function titleCase(slug) {
     .join(" ");
 }
 
-// Save a new order: { name, email, customerId, orderDetails }
-// orderDetails holds the item information and the order status.
-// The vendor information is looked up from the ordered item in the pizza collection.
-app.post("/orders", async (req, res) => {
-  const { name, email, customerId, orderDetails } = req.body;
+// "Classic Pepperoni" -> "classic-pepperoni"
+const toSlug = (text) => String(text).toLowerCase().trim().replace(/\s+/g, "-");
 
-  // name, email and the item are required
-  if (!name || !email) {
-    return res.status(400).json({ error: "name and email are required" });
+
+//apis
+
+// Customers only see approved items
+const publicItems = { status: "approved" };
+
+app.get("/", async (req, res) => {
+  const items = await collection.find(publicItems).toArray();
+  res.json(items);
+});
+
+
+// All unique categories of the approved items
+app.get("/category", async (req, res) => {
+  const categories = await collection.distinct("category", publicItems);
+  res.json(categories);
+});
+
+// 6 featured items (highest rated first)
+app.get("/featured", async (req, res) => {
+  const items = await collection.find(publicItems).sort({ rating: -1 }).limit(6).toArray();
+  res.json(items);
+});
+
+
+// ---- Orders ----
+
+// Save a new order: { customerId, name, email, orderDetails }
+// orderDetails holds the item information, delivery details and the status.
+// vendorId is looked up from the ordered item.
+app.post("/orders", async (req, res) => {
+  const { customerId, name, email, orderDetails } = req.body;
+
+  if (!name || !email || !isId(customerId)) {
+    return res.status(400).json({ error: "customerId, name and email are required" });
   }
-  if (!orderDetails?.itemId) {
+  if (!isId(orderDetails?.itemId)) {
     return res.status(400).json({ error: "orderDetails.itemId is required" });
   }
 
-  // Find the ordered item to get the vendor information
-  const item = ObjectId.isValid(orderDetails.itemId) && orderDetails.itemId.length === 24
-    ? await collection.findOne({ _id: new ObjectId(orderDetails.itemId) })
-    : null;
+  // Find the ordered item to get the vendor
+  const item = await collection.findOne({ _id: new ObjectId(orderDetails.itemId) });
+  if (!item) {
+    return res.status(404).json({ error: "Item not found" });
+  }
 
-  const vendor = {
-    id: item?.vendor?.id ?? null,
-    name: item?.vendor?.name ?? titleCase(item?.shop ?? orderDetails.shop),
-    email: item?.vendor?.email ?? null,
-    shop: item?.shop ?? orderDetails.shop ?? null,
-    location: item?.location ?? null,
-  };
+  const vendorUser = item.vendorId ? await users.findOne({ _id: item.vendorId }) : null;
 
   const result = await orders.insertOne({
+    customerId: new ObjectId(customerId),
+    vendorId: item.vendorId ?? null,
     name,
     email,
-    customer: { id: customerId ?? null, name, email },
-    vendor,
-    orderDetails: { ...orderDetails, status: "pending" },
+    vendor: {
+      name: vendorUser?.businessName || vendorUser?.name || titleCase(item.shop),
+      shop: item.shop ?? null,
+      location: item.location ?? null,
+    },
+    orderDetails: {
+      ...orderDetails,
+      itemId: item._id,
+      status: "pending",
+    },
     createdAt: new Date(),
   });
   res.status(201).json({ orderId: result.insertedId });
@@ -119,45 +141,56 @@ app.get("/orders", async (req, res) => {
   res.json(list);
 });
 
-//
-
-// Orders of one vendor, newest first: GET /orders/vendor?email=vendor@email.com
-app.get("/orders/vendor", async (req, res) => {
-  const { email } = req.query;
-  if (!email) {
-    return res.status(400).json({ error: "email is required" });
+// Orders of one customer, newest first: GET /orders/customer?customerId=...
+app.get("/orders/customer", async (req, res) => {
+  const { customerId } = req.query;
+  if (!isId(customerId)) {
+    return res.status(400).json({ error: "customerId is required" });
   }
   const list = await orders
-    .find({ "vendor.email": email })
+    .find({ customerId: new ObjectId(customerId) })
     .sort({ createdAt: -1 })
     .toArray();
   res.json(list);
 });
 
-// Vendor moves an order forward: PATCH /orders/:id/status  { email, action }
-//   accept   : pending    -> in process
-//   reject   : pending    -> rejected
-//   complete : in process -> completed
+// Orders of one vendor, newest first: GET /orders/vendor?vendorId=...
+app.get("/orders/vendor", async (req, res) => {
+  const { vendorId } = req.query;
+  if (!isId(vendorId)) {
+    return res.status(400).json({ error: "vendorId is required" });
+  }
+  const list = await orders
+    .find({ vendorId: new ObjectId(vendorId) })
+    .sort({ createdAt: -1 })
+    .toArray();
+  res.json(list);
+});
+
+// Vendor moves an order forward: PATCH /orders/:id/status  { vendorId, action }
+//   accept   : pending  -> accepted
+//   reject   : pending  -> rejected
+//   complete : accepted -> completed
 // Only the vendor who owns the order can do it, and each step works only once.
 const orderSteps = {
-  accept: { from: "pending", to: "in process" },
+  accept: { from: "pending", to: "accepted" },
   reject: { from: "pending", to: "rejected" },
-  complete: { from: "in process", to: "completed" },
+  complete: { from: "accepted", to: "completed" },
 };
 
 app.patch("/orders/:id/status", async (req, res) => {
   const { id } = req.params;
-  const { email, action } = req.body;
+  const { vendorId, action } = req.body;
   const step = orderSteps[action];
 
-  if (id.length !== 24 || !ObjectId.isValid(id)) {
+  if (!isId(id)) {
     return res.status(400).json({ error: "Invalid order id" });
   }
-  if (!email || !step) {
-    return res.status(400).json({ error: "email and a valid action are required" });
+  if (!isId(vendorId) || !step) {
+    return res.status(400).json({ error: "vendorId and a valid action are required" });
   }
 
-  const owner = { _id: new ObjectId(id), "vendor.email": email };
+  const owner = { _id: new ObjectId(id), vendorId: new ObjectId(vendorId) };
 
   // The status is part of the filter, so a second click changes nothing
   const result = await orders.updateOne(
@@ -178,55 +211,53 @@ app.patch("/orders/:id/status", async (req, res) => {
   });
 });
 
-// Cancel (delete) a pending order: DELETE /orders/:id?email=customer@email.com
-app.delete("/orders/:id", async (req, res) => {
+// Customer cancels a pending order: PATCH /orders/:id/cancel  { customerId }
+// The order stays in the collection with the status "cancelled".
+app.patch("/orders/:id/cancel", async (req, res) => {
   const { id } = req.params;
-  const { email } = req.query;
+  const { customerId } = req.body;
 
-  if (id.length !== 24 || !ObjectId.isValid(id)) {
-    return res.status(400).json({ error: "Invalid order id" });
-  }
-  if (!email) {
-    return res.status(400).json({ error: "email is required" });
+  if (!isId(id) || !isId(customerId)) {
+    return res.status(400).json({ error: "Invalid order id or customerId" });
   }
 
-  // Delete only if it belongs to this email AND is still pending
-  const result = await orders.deleteOne({
-    _id: new ObjectId(id),
-    email,
-    "orderDetails.status": "pending",
-  });
+  // Only the customer's own order, and only while it is still pending
+  const result = await orders.updateOne(
+    { _id: new ObjectId(id), customerId: new ObjectId(customerId), "orderDetails.status": "pending" },
+    { $set: { "orderDetails.status": "cancelled", updatedAt: new Date() } }
+  );
 
-  if (result.deletedCount === 0) {
+  if (result.matchedCount === 0) {
     return res.status(404).json({ error: "Pending order not found" });
   }
-  res.json({ message: "Order cancelled" });
+  res.json({ message: "Order cancelled", status: "cancelled" });
 });
 
-// Vendor adds a menu item: { name, category, description, price, location, image, vendor: { id, name, email } }
+
+// ---- Vendor menu ----
+
+// Vendor adds a menu item:
+// { vendorId, vendorName, itemName, category, description, price, location, image }
 // It is saved with status "pending" until an admin approves it.
 app.post("/menu", async (req, res) => {
-  const { name, category, description, price, location, image, vendor } = req.body;
+  const { vendorId, vendorName, itemName, category, description, price, location, image } = req.body;
 
   const cleanPrice = Number(price);
   if (
-    !name || !category || !description || !location || !image ||
-    !vendor?.id || !vendor?.email ||
+    !isId(vendorId) || !itemName || !category || !description || !location || !image ||
     !Number.isFinite(cleanPrice) || cleanPrice <= 0
   ) {
     return res.status(400).json({ error: "All fields are required" });
   }
 
-  // "Classic Pepperoni" -> "classic-pepperoni"
-  const toSlug = (text) => text.toLowerCase().trim().replace(/\s+/g, "-");
-
   const result = await collection.insertOne({
-    name,
-    slug: toSlug(name),
+    vendorId: new ObjectId(vendorId),
+    itemName,
+    slug: toSlug(itemName),
     description,
     category,
     emoji: "🍕",
-    shop: toSlug(vendor.name || vendor.email),
+    shop: toSlug(vendorName || "vendor"),
     location,
     price: cleanPrice,
     sizes: [{ label: "Regular", price: cleanPrice }],
@@ -235,147 +266,219 @@ app.post("/menu", async (req, res) => {
     isVeg: false,
     isSpicy: false,
     rating: 0,
-    available: true,
     prepTimeMin: 20,
     calories: 0,
-    image,
+    images: [image],
     status: "pending",
-    vendor: { id: vendor.id, name: vendor.name, email: vendor.email },
     createdAt: new Date(),
   });
   res.status(201).json({ itemId: result.insertedId, status: "pending" });
 });
 
-// Get all items of one vendor (any status)
-// GET /menu/mine?email=vendor@email.com
+// Get all items of one vendor (any status): GET /menu/mine?vendorId=...
 app.get("/menu/mine", async (req, res) => {
-  const { email } = req.query;
+  const { vendorId } = req.query;
 
-  // Without an email the filter would match items that have no vendor
-  if (!email) {
-    return res.status(400).json({ error: "email is required" });
+  // Without a vendorId the filter would match items that have no vendor
+  if (!isId(vendorId)) {
+    return res.status(400).json({ error: "vendorId is required" });
   }
 
-  const items = await collection.find({ "vendor.email": email }).sort({ createdAt: -1 }).toArray();
+  const items = await collection
+    .find({ vendorId: new ObjectId(vendorId) })
+    .sort({ createdAt: -1 })
+    .toArray();
   res.json(items);
 });
 
-// Vendor turns a published item on/off
-// PATCH /menu/:id   body: { email, available }
+// Vendor switches an item on (approved) or off (inactive)
+// PATCH /menu/:id   body: { vendorId, active: true | false }
+// Pending and rejected items cannot be switched.
 app.patch("/menu/:id", async (req, res) => {
-  const { email, available } = req.body;
+  const { id } = req.params;
+  const { vendorId, active } = req.body;
 
-  // Only the owner can change it, and only if it is published
-  await collection.updateOne(
-    { _id: new ObjectId(req.params.id), "vendor.email": email, status: "publish" },
-    { $set: { available } }
+  if (!isId(id) || !isId(vendorId) || typeof active !== "boolean") {
+    return res.status(400).json({ error: "id, vendorId and active are required" });
+  }
+
+  const result = await collection.updateOne(
+    { _id: new ObjectId(id), vendorId: new ObjectId(vendorId), status: active ? "inactive" : "approved" },
+    { $set: { status: active ? "approved" : "inactive" } }
   );
-  res.json({ message: "Item updated" });
+
+  if (result.matchedCount === 0) {
+    return res.status(404).json({ error: "Item not found or it cannot be switched" });
+  }
+  res.json({ message: "Item updated", status: active ? "approved" : "inactive" });
 });
 
 // Vendor edits an item. It goes back to "pending" so the admin can approve it again.
-// PUT /menu/:id   body: { email, name, category, description, price, location, image }
-// image is optional (the old image stays if it is not sent)
+// PUT /menu/:id   body: { vendorId, itemName, category, description, price, location, image }
+// image is optional (the old images stay if it is not sent)
 app.put("/menu/:id", async (req, res) => {
-  const { email, name, category, description, price, location, image } = req.body;
+  const { id } = req.params;
+  const { vendorId, itemName, category, description, price, location, image } = req.body;
+
+  const cleanPrice = Number(price);
+  if (
+    !isId(id) || !isId(vendorId) || !itemName || !category || !description || !location ||
+    !Number.isFinite(cleanPrice) || cleanPrice <= 0
+  ) {
+    return res.status(400).json({ error: "All fields are required" });
+  }
 
   const changes = {
-    name,
+    itemName,
     category,
     description,
     location,
-    price: Number(price),
-    sizes: [{ label: "Regular", price: Number(price) }],
+    price: cleanPrice,
+    sizes: [{ label: "Regular", price: cleanPrice }],
     status: "pending",
     updatedAt: new Date(),
   };
-  if (image) changes.image = image;
+  if (image) changes.images = [image];
 
   // Only the owner can edit
-  await collection.updateOne(
-    { _id: new ObjectId(req.params.id), "vendor.email": email },
+  const result = await collection.updateOne(
+    { _id: new ObjectId(id), vendorId: new ObjectId(vendorId) },
     { $set: changes }
   );
+
+  if (result.matchedCount === 0) {
+    return res.status(404).json({ error: "Item not found" });
+  }
   res.json({ message: "Item updated", status: "pending" });
 });
 
-// Vendor deletes an item
-// DELETE /menu/:id?email=vendor@email.com
+// Vendor deletes an item: DELETE /menu/:id?vendorId=...
 app.delete("/menu/:id", async (req, res) => {
+  const { id } = req.params;
+  const { vendorId } = req.query;
+
+  if (!isId(id) || !isId(vendorId)) {
+    return res.status(400).json({ error: "id and vendorId are required" });
+  }
+
   // Only the owner can delete
-  await collection.deleteOne({ _id: new ObjectId(req.params.id), "vendor.email": req.query.email });
+  const result = await collection.deleteOne({
+    _id: new ObjectId(id),
+    vendorId: new ObjectId(vendorId),
+  });
+
+  if (result.deletedCount === 0) {
+    return res.status(404).json({ error: "Item not found" });
+  }
   res.json({ message: "Item deleted" });
 });
 
+
 // ---- Admin ----
 
-// All items with every status (customers only see published ones)
+// All items with every status, with the vendor's name and email
 // GET /admin/menu
 app.get("/admin/menu", async (req, res) => {
-  const items = await collection.find().sort({ createdAt: -1 }).toArray();
-  res.json(items);
+  const items = await collection
+    .aggregate([
+      { $sort: { createdAt: -1 } },
+      { $lookup: { from: "user", localField: "vendorId", foreignField: "_id", as: "vendorUser" } },
+    ])
+    .toArray();
+
+  res.json(
+    items.map(({ vendorUser, ...item }) => ({
+      ...item,
+      vendorName: vendorUser[0]?.businessName || vendorUser[0]?.name || titleCase(item.shop),
+      vendorEmail: vendorUser[0]?.email ?? null,
+    }))
+  );
 });
 
-// Approve / reject an item
+// Change the status of an item
 // PATCH /admin/menu/:id/status   body: { status }
-//   publish  = approved, shown on the public menu
+//   approved = shown on the public menu
 //   pending  = waiting for review, hidden
 //   rejected = hidden
+//   inactive = switched off, hidden
+const itemStatuses = ["pending", "approved", "rejected", "inactive"];
+
 app.patch("/admin/menu/:id/status", async (req, res) => {
+  const { id } = req.params;
   const { status } = req.body;
 
-  // Any other status would make the item visible to customers
-  if (!["publish", "pending", "rejected"].includes(status)) {
-    return res.status(400).json({ error: "status must be publish, pending or rejected" });
+  if (!isId(id)) {
+    return res.status(400).json({ error: "Invalid item id" });
+  }
+  // Any other status would make the item visible to customers by mistake
+  if (!itemStatuses.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${itemStatuses.join(", ")}` });
   }
 
-  await collection.updateOne(
-    { _id: new ObjectId(req.params.id) },
+  const result = await collection.updateOne(
+    { _id: new ObjectId(id) },
     { $set: { status, reviewedAt: new Date() } }
   );
+  if (result.matchedCount === 0) {
+    return res.status(404).json({ error: "Item not found" });
+  }
   res.json({ message: "Status updated", status });
 });
 
 // Admin deletes any item
 // DELETE /admin/menu/:id
 app.delete("/admin/menu/:id", async (req, res) => {
-  await collection.deleteOne({ _id: new ObjectId(req.params.id) });
+  const { id } = req.params;
+  if (!isId(id)) {
+    return res.status(400).json({ error: "Invalid item id" });
+  }
+
+  const result = await collection.deleteOne({ _id: new ObjectId(id) });
+  if (result.deletedCount === 0) {
+    return res.status(404).json({ error: "Item not found" });
+  }
   res.json({ message: "Item deleted" });
 });
 
 // All registered users (Better Auth "user" collection, no passwords)
 // GET /users
 app.get("/users", async (req, res) => {
-  const list = await db
-    .collection("user")
-    .find({}, { projection: { name: 1, email: 1, role: 1, blocked: 1, emailVerified: 1, image: 1, createdAt: 1 } })
+  const list = await users
+    .find({}, { projection: { name: 1, email: 1, image: 1, role: 1, isBlocked: 1, businessName: 1, subscriptionPlan: 1, subscriptionExpiresAt: 1, emailVerified: 1, createdAt: 1 } })
     .sort({ createdAt: -1 })
     .toArray();
   res.json(list);
 });
 
 // Block or unblock a user (admins are never blocked)
-// PATCH /users/:id/block   body: { blocked: true | false }
+// PATCH /users/:id/block   body: { isBlocked: true | false }
 app.patch("/users/:id/block", async (req, res) => {
-  const { blocked } = req.body;
-  const userId = new ObjectId(req.params.id);
+  const { id } = req.params;
+  const { isBlocked } = req.body;
 
-  await db
-    .collection("user")
-    .updateOne({ _id: userId, role: { $ne: "admin" } }, { $set: { blocked, updatedAt: new Date() } });
+  if (!isId(id) || typeof isBlocked !== "boolean") {
+    return res.status(400).json({ error: "Invalid user id or isBlocked" });
+  }
+  const userId = new ObjectId(id);
+
+  const result = await users.updateOne(
+    { _id: userId, role: { $ne: "admin" } },
+    { $set: { isBlocked, updatedAt: new Date() } }
+  );
+  if (result.matchedCount === 0) {
+    return res.status(404).json({ error: "User not found, or an admin (admins cannot be blocked)" });
+  }
 
   // A blocked user is logged out at once
-  if (blocked) {
+  if (isBlocked) {
     await db.collection("session").deleteMany({ userId });
   }
-  res.json({ message: blocked ? "User blocked" : "User unblocked", blocked });
+  res.json({ message: isBlocked ? "User blocked" : "User unblocked", isBlocked });
 });
 
 // Numbers for the admin dashboard
 // GET /stats
 app.get("/stats", async (req, res) => {
-  const users = db.collection("user");
-
   res.json({
     users: await users.countDocuments(),
     vendors: await users.countDocuments({ role: "vendor" }),
@@ -387,23 +490,34 @@ app.get("/stats", async (req, res) => {
 });
 
 // Transactions for the admin. READ ONLY: there is no route that changes one.
-
+// The payment status is worked out from the order status.
 const paymentStatusOf = {
   pending: "pending",
-  "in process": "paid",
+  accepted: "paid",
   completed: "paid",
   rejected: "refunded",
+  cancelled: "refunded",
 };
 
 app.get("/admin/transactions", async (req, res) => {
-  const list = await orders.find().sort({ createdAt: -1 }).toArray();
+  const list = await orders
+    .aggregate([
+      { $sort: { createdAt: -1 } },
+      { $lookup: { from: "user", localField: "vendorId", foreignField: "_id", as: "vendorUser" } },
+    ])
+    .toArray();
 
   const transactions = list.map((order) => {
     const d = order.orderDetails || {};
+    const vendorUser = order.vendorUser[0];
     return {
       _id: order._id,
-      vendor: order.vendor || null,
-      customer: order.customer || { name: order.name, email: order.email },
+      vendor: {
+        name: vendorUser?.businessName || vendorUser?.name || order.vendor?.name || null,
+        email: vendorUser?.email ?? null,
+        shop: order.vendor?.shop ?? null,
+      },
+      customer: { name: order.name, email: order.email },
       itemName: d.itemName,
       amount: d.total,
       cardLast4: d.cardLast4,
