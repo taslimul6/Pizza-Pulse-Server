@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { MongoClient, ObjectId } from "mongodb";
+import Stripe from "stripe";
 import { createAuth } from "./src/middleware/auth.js";
 
 dotenv.config();
@@ -30,6 +31,7 @@ const db = client.db("pizzaPulse");
 const collection = db.collection("menuItems");
 const orders = db.collection("orders");
 const users = db.collection("user"); // Better Auth users
+const payments = db.collection("payments"); // vendor subscription payments
 
 // JWT checks for the protected routes (see src/middleware/auth.js)
 //   authenticate         : the request must carry a valid, unexpired token
@@ -43,6 +45,8 @@ connectToMongoDB().then(async () => {
     await orders.createIndex({ customerId: 1, createdAt: -1 });
     await orders.createIndex({ vendorId: 1, createdAt: -1 });
     await collection.createIndex({ vendorId: 1, createdAt: -1 });
+    // one Stripe payment can give Premium only once
+    await payments.createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true });
   } catch (err) {
     console.dir(err);
   }
@@ -82,9 +86,30 @@ const toSlug = (text) => String(text).toLowerCase().trim().replace(/\s+/g, "-");
 // Customers only see approved items
 const publicItems = { status: "approved" };
 
+// Approved items with "vendorPremium": true when the vendor's premium plan is active.
+// featured = premium vendors first, then the best rated, 6 items.
+async function approvedItems({ featured = false } = {}) {
+  const pipeline = [
+    { $match: publicItems },
+    { $lookup: { from: "user", localField: "vendorId", foreignField: "_id", as: "vendorUser" } },
+    {
+      $addFields: {
+        vendorPremium: {
+          $and: [
+            { $eq: [{ $first: "$vendorUser.subscriptionPlan" }, "premium"] },
+            { $gt: [{ $first: "$vendorUser.subscriptionExpiresAt" }, new Date()] },
+          ],
+        },
+      },
+    },
+    { $project: { vendorUser: 0 } },
+  ];
+  if (featured) pipeline.push({ $sort: { vendorPremium: -1, rating: -1 } }, { $limit: 6 });
+  return collection.aggregate(pipeline).toArray();
+}
+
 app.get("/", async (req, res) => {
-  const items = await collection.find(publicItems).toArray();
-  res.json(items);
+  res.json(await approvedItems());
 });
 
 
@@ -94,10 +119,9 @@ app.get("/category", async (req, res) => {
   res.json(categories);
 });
 
-// 6 featured items (highest rated first)
+// 6 featured items: premium vendors first (featured placement), then highest rated
 app.get("/featured", async (req, res) => {
-  const items = await collection.find(publicItems).sort({ rating: -1 }).limit(6).toArray();
-  res.json(items);
+  res.json(await approvedItems({ featured: true }));
 });
 
 
@@ -291,6 +315,13 @@ app.patch("/menu/:id", authenticate, requireRole("vendor"), async (req, res) => 
     return res.status(400).json({ error: "id and active are required" });
   }
 
+  // Free plan: at most 3 active items
+  if (active && !(await hasRoomForActiveItem(req.user))) {
+    return res.status(409).json({
+      error: `The Free plan allows ${FREE_ACTIVE_LIMIT} active items. Switch one off or upgrade to Premium.`,
+    });
+  }
+
   const result = await collection.updateOne(
     { _id: new ObjectId(id), vendorId: req.user._id, status: active ? "inactive" : "approved" },
     { $set: { status: active ? "approved" : "inactive" } }
@@ -403,6 +434,19 @@ app.patch("/admin/menu/:id/status", authenticate, requireRole("admin"), async (r
     return res.status(400).json({ error: `status must be one of: ${itemStatuses.join(", ")}` });
   }
 
+  // Approving counts as one more active item for the vendor (Free plan: max 3)
+  if (status === "approved") {
+    const item = await collection.findOne({ _id: new ObjectId(id) });
+    if (item && item.status !== "approved" && item.vendorId) {
+      const vendor = await users.findOne({ _id: item.vendorId });
+      if (!(await hasRoomForActiveItem(vendor))) {
+        return res.status(409).json({
+          error: `This vendor is on the Free plan and already has ${FREE_ACTIVE_LIMIT} active items.`,
+        });
+      }
+    }
+  }
+
   const result = await collection.updateOne(
     { _id: new ObjectId(id) },
     { $set: { status, reviewedAt: new Date() } }
@@ -473,12 +517,171 @@ app.get("/stats", authenticate, requireRole("admin"), async (req, res) => {
     customers: await users.countDocuments({ role: "customer" }),
     menuItems: await collection.countDocuments(),
     pendingItems: await collection.countDocuments({ status: "pending" }),
-    transactions: await orders.countDocuments(),
+    transactions: (await orders.countDocuments()) + (await payments.countDocuments()),
   });
 });
 
-// Transactions for the admin. READ ONLY: there is no route that changes one.
-// The payment status is worked out from the order status.
+
+// ---- Vendor subscription (vendor token needed) ----
+
+// Plans:
+//   free    : max 3 active (approved) menu items
+//   premium : unlimited active items, "Premium vendor" badge, shown first in Featured
+// Premium lasts PREMIUM_DAYS after each payment and does not renew by itself.
+const FREE_ACTIVE_LIMIT = 3;
+const PREMIUM_PRICE = 19.99;
+const PREMIUM_DAYS = 30;
+
+// True when the user has a premium plan that has not ended yet
+const isPremium = (user) =>
+  user?.subscriptionPlan === "premium" &&
+  !!user.subscriptionExpiresAt &&
+  new Date(user.subscriptionExpiresAt) > new Date();
+
+// Can this vendor have one more approved item? (Free plan: max 3)
+// Used by PATCH /menu/:id and PATCH /admin/menu/:id/status
+async function hasRoomForActiveItem(vendor) {
+  if (!vendor || isPremium(vendor)) return true;
+  const active = await collection.countDocuments({ vendorId: vendor._id, status: "approved" });
+  return active < FREE_ACTIVE_LIMIT;
+}
+
+// The vendor's plan: GET /subscription
+app.get("/subscription", authenticate, requireRole("vendor"), async (req, res) => {
+  const premium = isPremium(req.user);
+  res.json({
+    plan: premium ? "premium" : "free",
+    expiresAt: premium ? req.user.subscriptionExpiresAt : null,
+    activeItems: await collection.countDocuments({ vendorId: req.user._id, status: "approved" }),
+    activeLimit: premium ? null : FREE_ACTIVE_LIMIT,
+    price: PREMIUM_PRICE,
+    periodDays: PREMIUM_DAYS,
+  });
+});
+
+// ---- Stripe (vendor subscriptions only) ----
+// Flow:
+// 1. POST /subscription/checkout  -> we create a Stripe Checkout page and send its url.
+//    The vendor pays on Stripe's own page (we never see the card).
+// 2. Stripe sends the vendor back to /vendor/subscription?session_id=...
+// 3. POST /subscription/confirm { sessionId } -> we ask Stripe if that session is
+//    paid and belongs to this vendor, then give 30 days of Premium.
+//    The same session can only be used once (unique index on stripeSessionId).
+// Env: STRIPE_SECRET_KEY (sk_test_... in test mode), AUTH_URL (the Next.js app, for the return links)
+let stripeClient;
+function stripe() {
+  stripeClient ??= new Stripe(process.env.STRIPE_SECRET_KEY);
+  return stripeClient;
+}
+
+// Create the Stripe Checkout page: POST /subscription/checkout
+app.post("/subscription/checkout", authenticate, requireRole("vendor"), async (req, res) => {
+  if (!process.env.STRIPE_SECRET_KEY) {
+    return res.status(500).json({ error: "Stripe is not set up on the server" });
+  }
+
+  const appUrl = new URL(process.env.AUTH_URL).origin;
+  const vendorId = req.user._id.toHexString();
+
+  const session = await stripe().checkout.sessions.create({
+    mode: "payment", // one payment = 30 days, it does not renew by itself
+    line_items: [
+      {
+        quantity: 1,
+        price_data: {
+          currency: "usd",
+          unit_amount: Math.round(PREMIUM_PRICE * 100), // in cents
+          product_data: {
+            name: `PizzaHub Premium (${PREMIUM_DAYS} days)`,
+            description: "Unlimited active items, Premium vendor badge, featured placement",
+          },
+        },
+      },
+    ],
+    customer_email: req.user.email,
+    client_reference_id: vendorId,
+    metadata: { vendorId, plan: "premium" },
+    success_url: `${appUrl}/vendor/subscription?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${appUrl}/vendor/subscription?cancelled=1`,
+  });
+
+  res.status(201).json({ url: session.url });
+});
+
+// Check a finished Stripe Checkout and give Premium: POST /subscription/confirm { sessionId }
+// Paying again while premium adds 30 more days on top of the current end date.
+app.post("/subscription/confirm", authenticate, requireRole("vendor"), async (req, res) => {
+  const { sessionId } = req.body;
+  if (typeof sessionId !== "string" || !sessionId.startsWith("cs_")) {
+    return res.status(400).json({ error: "Invalid sessionId" });
+  }
+
+  // Already used? Then just report the current plan (refreshing the page is safe)
+  const done = await payments.findOne({ stripeSessionId: sessionId });
+  if (done) {
+    if (!done.vendorId.equals(req.user._id)) {
+      return res.status(403).json({ error: "This payment belongs to another vendor" });
+    }
+    return res.json({ plan: "premium", expiresAt: req.user.subscriptionExpiresAt, alreadyApplied: true });
+  }
+
+  // Ask Stripe (never trust the browser about a payment)
+  let session;
+  try {
+    session = await stripe().checkout.sessions.retrieve(sessionId, {
+      expand: ["payment_intent.latest_charge"],
+    });
+  } catch {
+    return res.status(404).json({ error: "Stripe session not found" });
+  }
+
+  if (session.metadata?.vendorId !== req.user._id.toHexString()) {
+    return res.status(403).json({ error: "This payment belongs to another vendor" });
+  }
+  if (session.payment_status !== "paid") {
+    return res.status(402).json({ error: "The payment is not completed" });
+  }
+
+  const now = new Date();
+  const start = isPremium(req.user) ? new Date(req.user.subscriptionExpiresAt) : now;
+  const end = new Date(start.getTime() + PREMIUM_DAYS * 24 * 60 * 60 * 1000);
+  const charge = session.payment_intent?.latest_charge;
+
+  try {
+    await payments.insertOne({
+      vendorId: req.user._id,
+      plan: "premium",
+      amount: session.amount_total / 100,
+      currency: session.currency,
+      cardLast4: charge?.payment_method_details?.card?.last4 ?? null,
+      status: "paid",
+      stripeSessionId: session.id,
+      stripePaymentIntentId: session.payment_intent?.id ?? null,
+      periodStart: start,
+      periodEnd: end,
+      createdAt: now,
+    });
+  } catch (err) {
+    // Two requests at the same time: the unique index lets only one through
+    if (err?.code === 11000) {
+      return res.json({ plan: "premium", alreadyApplied: true });
+    }
+    throw err;
+  }
+
+  await users.updateOne(
+    { _id: req.user._id },
+    { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: end, updatedAt: now } }
+  );
+
+  res.status(201).json({ plan: "premium", expiresAt: end });
+});
+
+
+// ---- Admin transactions (admin token needed) ----
+
+// Orders and vendor subscription payments together. READ ONLY: no route changes one.
+// The payment status of an order is worked out from the order status.
 const paymentStatusOf = {
   pending: "pending",
   accepted: "paid",
@@ -487,22 +690,26 @@ const paymentStatusOf = {
   cancelled: "refunded",
 };
 
+// GET /admin/transactions
 app.get("/admin/transactions", authenticate, requireRole("admin"), async (req, res) => {
-  const list = await orders
-    .aggregate([
-      { $sort: { createdAt: -1 } },
-      { $lookup: { from: "user", localField: "vendorId", foreignField: "_id", as: "vendorUser" } },
-    ])
-    .toArray();
+  // Brings the vendor's user document along with each order / payment
+  const vendorLookup = {
+    $lookup: { from: "user", localField: "vendorId", foreignField: "_id", as: "vendorUser" },
+  };
+  const orderList = await orders.aggregate([vendorLookup]).toArray();
+  const paymentList = await payments.aggregate([vendorLookup]).toArray();
 
-  const transactions = list.map((order) => {
+  // Customer orders (the customer pays the vendor)
+  const orderRows = orderList.map((order) => {
     const d = order.orderDetails || {};
-    const vendorUser = order.vendorUser[0];
+    const vendor = order.vendorUser[0];
     return {
       _id: order._id,
+      type: "order",
+      plan: null,
       vendor: {
-        name: vendorUser?.businessName || vendorUser?.name || order.vendor?.name || null,
-        email: vendorUser?.email ?? null,
+        name: vendor?.businessName || vendor?.name || order.vendor?.name || null,
+        email: vendor?.email ?? null,
         shop: order.vendor?.shop ?? null,
       },
       customer: { name: order.name, email: order.email },
@@ -514,6 +721,29 @@ app.get("/admin/transactions", authenticate, requireRole("admin"), async (req, r
       createdAt: order.createdAt,
     };
   });
+
+  // Subscription payments (the vendor pays PizzaHub)
+  const subscriptionRows = paymentList.map((payment) => {
+    const vendor = payment.vendorUser[0];
+    return {
+      _id: payment._id,
+      type: "subscription",
+      plan: payment.plan,
+      vendor: { name: vendor?.businessName || vendor?.name || null, email: vendor?.email ?? null, shop: null },
+      customer: null,
+      itemName: `${titleCase(payment.plan)} plan (${PREMIUM_DAYS} days)`,
+      amount: payment.amount,
+      cardLast4: payment.cardLast4,
+      orderStatus: null,
+      paymentStatus: payment.status,
+      createdAt: payment.createdAt,
+    };
+  });
+
+  // Orders and subscriptions together, newest first
+  const transactions = [...orderRows, ...subscriptionRows].sort(
+    (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
+  );
   res.json(transactions);
 });
 
