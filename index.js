@@ -150,6 +150,21 @@ app.post("/orders", authenticate, async (req, res) => {
     return res.status(403).json({ error: "You cannot order your own item.", code: "OWN_ITEM" });
   }
 
+  // No duplicate active orders: the same customer cannot have two pending or
+  // accepted orders for the same item and the same delivery date
+  const duplicate = await orders.findOne({
+    customerId: req.user._id,
+    "orderDetails.itemId": item._id,
+    "orderDetails.deliveryDate": orderDetails.deliveryDate,
+    "orderDetails.status": { $in: ["pending", "accepted"] },
+  });
+  if (duplicate) {
+    return res.status(409).json({
+      error: "You already have an active order for this item on this delivery date.",
+      code: "DUPLICATE_ORDER",
+    });
+  }
+
   const vendorUser = item.vendorId ? await users.findOne({ _id: item.vendorId }) : null;
 
   const result = await orders.insertOne({
