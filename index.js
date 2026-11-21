@@ -31,7 +31,9 @@ const db = client.db("pizzaPulse");
 const collection = db.collection("menuItems");
 const orders = db.collection("orders");
 const users = db.collection("user"); // Better Auth users
-const payments = db.collection("payments"); // vendor subscription payments
+// Vendor subscription payments. Keys: vendorId (ref: users), plan, amount, currency,
+// stripeSessionId, stripeSubscriptionId, status, createdAt (+ cardLast4, periods, payment intent)
+const payments = db.collection("transactions");
 
 // JWT checks for the protected routes (see src/middleware/auth.js)
 //   authenticate         : the request must carry a valid, unexpired token
@@ -127,8 +129,9 @@ app.get("/featured", async (req, res) => {
 
 // ---- Orders (token needed) ----
 
-// Save a new order: { orderDetails }
-// The customer comes from the token. vendorId is looked up from the ordered item.
+// Save a new order
+// POST /orders   body: { orderDetails: { itemId, ... } }
+// The customer comes from the token, the vendor from the ordered item.
 app.post("/orders", authenticate, async (req, res) => {
   const { orderDetails } = req.body;
 
@@ -136,7 +139,7 @@ app.post("/orders", authenticate, async (req, res) => {
     return res.status(400).json({ error: "orderDetails.itemId is required" });
   }
 
-  // Find the ordered item to get the vendor
+  // Find the ordered item (only approved items can be ordered)
   const item = await collection.findOne({ _id: new ObjectId(orderDetails.itemId), ...publicItems });
   if (!item) {
     return res.status(404).json({ error: "Item not found" });
@@ -177,27 +180,21 @@ app.get("/orders", authenticate, requireRole("admin"), async (req, res) => {
 
 // Orders of the logged-in customer, newest first
 app.get("/orders/customer", authenticate, async (req, res) => {
-  const list = await orders
-    .find({ customerId: req.user._id })
-    .sort({ createdAt: -1 })
-    .toArray();
+  const list = await orders.find({ customerId: req.user._id }).sort({ createdAt: -1 }).toArray();
   res.json(list);
 });
 
 // Orders of the logged-in vendor, newest first
 app.get("/orders/vendor", authenticate, requireRole("vendor"), async (req, res) => {
-  const list = await orders
-    .find({ vendorId: req.user._id })
-    .sort({ createdAt: -1 })
-    .toArray();
+  const list = await orders.find({ vendorId: req.user._id }).sort({ createdAt: -1 }).toArray();
   res.json(list);
 });
 
-// Vendor moves an order forward: PATCH /orders/:id/status  { action }
+// Vendor moves an order forward
+// PATCH /orders/:id/status   body: { action }
 //   accept   : pending  -> accepted
 //   reject   : pending  -> rejected
 //   complete : accepted -> completed
-// Only the vendor who owns the order can do it, and each step works only once.
 const orderSteps = {
   accept: { from: "pending", to: "accepted" },
   reject: { from: "pending", to: "rejected" },
@@ -206,39 +203,26 @@ const orderSteps = {
 
 app.patch("/orders/:id/status", authenticate, requireRole("vendor"), async (req, res) => {
   const { id } = req.params;
-  const { action } = req.body;
-  const step = orderSteps[action];
+  const step = orderSteps[req.body.action];
 
-  if (!isId(id)) {
-    return res.status(400).json({ error: "Invalid order id" });
-  }
-  if (!step) {
-    return res.status(400).json({ error: "A valid action is required" });
+  if (!isId(id) || !step) {
+    return res.status(400).json({ error: "A valid order id and action are required" });
   }
 
-  const owner = { _id: new ObjectId(id), vendorId: req.user._id };
-
-  // The status is part of the filter, so a second click changes nothing
+  // Only this vendor's order, and only in the right status (so a second click changes nothing)
   const result = await orders.updateOne(
-    { ...owner, "orderDetails.status": step.from },
+    { _id: new ObjectId(id), vendorId: req.user._id, "orderDetails.status": step.from },
     { $set: { "orderDetails.status": step.to, updatedAt: new Date() } }
   );
-  if (result.matchedCount === 1) {
-    return res.json({ message: "Order updated", status: step.to });
-  }
 
-  // Not changed: not the vendor's order, or it is not in the right status
-  const order = await orders.findOne(owner);
-  if (!order) {
-    return res.status(404).json({ error: "Order not found" });
+  if (result.matchedCount === 0) {
+    return res.status(404).json({ error: `No order found that can be moved with "${req.body.action}"` });
   }
-  res.status(409).json({
-    error: `Cannot ${action}: this order is ${order.orderDetails?.status}, it must be ${step.from}.`,
-  });
+  res.json({ message: "Order updated", status: step.to });
 });
 
-// Customer cancels a pending order: PATCH /orders/:id/cancel
-// The order stays in the collection with the status "cancelled".
+// Customer cancels a pending order (it stays in the collection as "cancelled")
+// PATCH /orders/:id/cancel
 app.patch("/orders/:id/cancel", authenticate, async (req, res) => {
   const { id } = req.params;
 
@@ -246,7 +230,7 @@ app.patch("/orders/:id/cancel", authenticate, async (req, res) => {
     return res.status(400).json({ error: "Invalid order id" });
   }
 
-  // Only the customer's own order, and only while it is still pending
+  // Only the customer's own order, and only while it is pending
   const result = await orders.updateOne(
     { _id: new ObjectId(id), customerId: req.user._id, "orderDetails.status": "pending" },
     { $set: { "orderDetails.status": "cancelled", updatedAt: new Date() } }
@@ -658,6 +642,9 @@ app.post("/subscription/confirm", authenticate, requireRole("vendor"), async (re
       cardLast4: session.payment_intent?.latest_charge?.payment_method_details?.card?.last4 ?? null,
       status: "paid",
       stripeSessionId: session.id,
+      // One-time Checkout payments (mode "payment") have no Stripe subscription, so this is null
+      stripeSubscriptionId:
+        typeof session.subscription === "string" ? session.subscription : session.subscription?.id ?? null,
       stripePaymentIntentId: session.payment_intent?.id ?? null,
       periodStart: start,
       periodEnd: end,
