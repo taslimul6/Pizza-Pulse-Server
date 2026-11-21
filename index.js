@@ -4,13 +4,15 @@ import dotenv from "dotenv";
 import { MongoClient, ObjectId } from "mongodb";
 import Stripe from "stripe";
 import { createAuth } from "./src/middleware/auth.js";
+import { errorHandler, notFound } from "./src/middleware/errors.js";
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
+// Only the PizzaHub client may call the API from a browser
+app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:3000", credentials: true }));
 app.use(express.json());
 
 // MongoDB connect
@@ -257,6 +259,8 @@ app.post("/orders", authenticate, async (req, res) => {
       itemId: item._id,
       status: "pending",
     },
+    // Every status change with its time (shown as the order timeline)
+    statusHistory: [{ status: "pending", at: new Date() }],
     createdAt: new Date(),
   });
   res.status(201).json({ orderId: result.insertedId });
@@ -302,7 +306,10 @@ app.patch("/orders/:id/status", authenticate, requireRole("vendor"), async (req,
   // Only this vendor's order, and only in the right status (so a second click changes nothing)
   const result = await orders.updateOne(
     { _id: new ObjectId(id), vendorId: req.user._id, "orderDetails.status": step.from },
-    { $set: { "orderDetails.status": step.to, updatedAt: new Date() } }
+    {
+      $set: { "orderDetails.status": step.to, updatedAt: new Date() },
+      $push: { statusHistory: { status: step.to, at: new Date() } },
+    }
   );
 
   if (result.matchedCount === 0) {
@@ -323,13 +330,56 @@ app.patch("/orders/:id/cancel", authenticate, async (req, res) => {
   // Only the customer's own order, and only while it is pending
   const result = await orders.updateOne(
     { _id: new ObjectId(id), customerId: req.user._id, "orderDetails.status": "pending" },
-    { $set: { "orderDetails.status": "cancelled", updatedAt: new Date() } }
+    {
+      $set: { "orderDetails.status": "cancelled", updatedAt: new Date() },
+      $push: { statusHistory: { status: "cancelled", at: new Date() } },
+    }
   );
 
   if (result.matchedCount === 0) {
     return res.status(404).json({ error: "Pending order not found" });
   }
   res.json({ message: "Order cancelled", status: "cancelled" });
+});
+
+// One order with its item picture and timeline: GET /orders/:id
+// Only the customer who placed it, the vendor who sells it, or an admin may see it.
+app.get("/orders/:id", authenticate, async (req, res) => {
+  const { id } = req.params;
+  if (!isId(id)) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+
+  const order = await orders.findOne({ _id: new ObjectId(id) });
+  if (!order) {
+    return res.status(404).json({ error: "Order not found" });
+  }
+
+  const isOwner = order.customerId?.equals(req.user._id) || order.vendorId?.equals(req.user._id);
+  if (!isOwner && req.user.role !== "admin") {
+    return res.status(403).json({ error: "This order belongs to someone else" });
+  }
+
+  // Item picture and emoji (the item may have changed or been removed since)
+  const item = await collection.findOne(
+    { _id: order.orderDetails?.itemId },
+    { projection: { images: 1, emoji: 1 } }
+  );
+
+  // Older orders have no history: rebuild what we know
+  const statusHistory = order.statusHistory ?? [
+    { status: "pending", at: order.createdAt },
+    ...(order.orderDetails?.status !== "pending"
+      ? [{ status: order.orderDetails?.status, at: order.updatedAt ?? null }]
+      : []),
+  ];
+
+  res.json({
+    ...order,
+    statusHistory,
+    itemImage: item?.images?.find((src) => String(src).startsWith("http")) ?? null,
+    itemEmoji: item?.emoji ?? "🍕",
+  });
 });
 
 
@@ -825,6 +875,10 @@ app.get("/admin/transactions", authenticate, requireRole("admin"), async (req, r
 });
 
 // Add new APIs above this line (keep app.listen last)
+
+// Unknown routes -> JSON 404, errors -> JSON 500 (details hidden in production)
+app.use(notFound);
+app.use(errorHandler);
 
 app.listen(PORT, () => {
   console.log("server is running at " + PORT);
