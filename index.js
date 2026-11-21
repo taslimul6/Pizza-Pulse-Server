@@ -142,6 +142,11 @@ app.post("/orders", authenticate, async (req, res) => {
     return res.status(404).json({ error: "Item not found" });
   }
 
+  // A vendor cannot order their own item
+  if (item.vendorId?.equals(req.user._id)) {
+    return res.status(403).json({ error: "You cannot order your own item.", code: "OWN_ITEM" });
+  }
+
   const vendorUser = item.vendorId ? await users.findOne({ _id: item.vendorId }) : null;
 
   const result = await orders.insertOne({
@@ -270,6 +275,14 @@ app.post("/menu", authenticate, requireRole("vendor"), async (req, res) => {
     return res.status(400).json({ error: "All fields are required" });
   }
 
+  // Free plan: at most 3 menu items in total (any status)
+  if (!(await hasRoom(req.user))) {
+    return res.status(403).json({
+      error: `The Free plan allows ${FREE_LIMIT} menu items. Upgrade to Premium to add more.`,
+      code: "FREE_ITEM_LIMIT",
+    });
+  }
+
   const result = await collection.insertOne({
     vendorId: req.user._id,
     itemName,
@@ -316,9 +329,9 @@ app.patch("/menu/:id", authenticate, requireRole("vendor"), async (req, res) => 
   }
 
   // Free plan: at most 3 active items
-  if (active && !(await hasRoomForActiveItem(req.user))) {
+  if (active && !(await hasRoom(req.user, { status: "approved" }))) {
     return res.status(409).json({
-      error: `The Free plan allows ${FREE_ACTIVE_LIMIT} active items. Switch one off or upgrade to Premium.`,
+      error: `The Free plan allows ${FREE_LIMIT} active items. Switch one off or upgrade to Premium.`,
     });
   }
 
@@ -439,9 +452,9 @@ app.patch("/admin/menu/:id/status", authenticate, requireRole("admin"), async (r
     const item = await collection.findOne({ _id: new ObjectId(id) });
     if (item && item.status !== "approved" && item.vendorId) {
       const vendor = await users.findOne({ _id: item.vendorId });
-      if (!(await hasRoomForActiveItem(vendor))) {
+      if (!(await hasRoom(vendor, { status: "approved" }))) {
         return res.status(409).json({
-          error: `This vendor is on the Free plan and already has ${FREE_ACTIVE_LIMIT} active items.`,
+          error: `This vendor is on the Free plan and already has ${FREE_LIMIT} active items.`,
         });
       }
     }
@@ -525,10 +538,10 @@ app.get("/stats", authenticate, requireRole("admin"), async (req, res) => {
 // ---- Vendor subscription (vendor token needed) ----
 
 // Plans:
-//   free    : max 3 active (approved) menu items
-//   premium : unlimited active items, "Premium vendor" badge, shown first in Featured
+//   free    : max 3 menu items (and so max 3 active items)
+//   premium : unlimited items, "Premium vendor" badge, shown first in Featured
 // Premium lasts PREMIUM_DAYS after each payment and does not renew by itself.
-const FREE_ACTIVE_LIMIT = 3;
+const FREE_LIMIT = 3;
 const PREMIUM_PRICE = 19.99;
 const PREMIUM_DAYS = 30;
 
@@ -538,12 +551,13 @@ const isPremium = (user) =>
   !!user.subscriptionExpiresAt &&
   new Date(user.subscriptionExpiresAt) > new Date();
 
-// Can this vendor have one more approved item? (Free plan: max 3)
-// Used by PATCH /menu/:id and PATCH /admin/menu/:id/status
-async function hasRoomForActiveItem(vendor) {
+// Can this vendor have one more item? Premium: always. Free: fewer than 3.
+//   hasRoom(vendor)                         counts all items    (POST /menu)
+//   hasRoom(vendor, { status: "approved" }) counts active items (switch on, approve)
+async function hasRoom(vendor, filter = {}) {
   if (!vendor || isPremium(vendor)) return true;
-  const active = await collection.countDocuments({ vendorId: vendor._id, status: "approved" });
-  return active < FREE_ACTIVE_LIMIT;
+  const count = await collection.countDocuments({ vendorId: vendor._id, ...filter });
+  return count < FREE_LIMIT;
 }
 
 // The vendor's plan: GET /subscription
@@ -552,8 +566,10 @@ app.get("/subscription", authenticate, requireRole("vendor"), async (req, res) =
   res.json({
     plan: premium ? "premium" : "free",
     expiresAt: premium ? req.user.subscriptionExpiresAt : null,
+    totalItems: await collection.countDocuments({ vendorId: req.user._id }),
+    itemLimit: premium ? null : FREE_LIMIT,
     activeItems: await collection.countDocuments({ vendorId: req.user._id, status: "approved" }),
-    activeLimit: premium ? null : FREE_ACTIVE_LIMIT,
+    activeLimit: premium ? null : FREE_LIMIT,
     price: PREMIUM_PRICE,
     periodDays: PREMIUM_DAYS,
   });
@@ -561,18 +577,15 @@ app.get("/subscription", authenticate, requireRole("vendor"), async (req, res) =
 
 // ---- Stripe (vendor subscriptions only) ----
 // Flow:
-// 1. POST /subscription/checkout  -> we create a Stripe Checkout page and send its url.
+// 1. POST /subscription/checkout -> we create a Stripe Checkout page and send its url.
 //    The vendor pays on Stripe's own page (we never see the card).
 // 2. Stripe sends the vendor back to /vendor/subscription?session_id=...
 // 3. POST /subscription/confirm { sessionId } -> we ask Stripe if that session is
 //    paid and belongs to this vendor, then give 30 days of Premium.
-//    The same session can only be used once (unique index on stripeSessionId).
+//    The same session works only once (unique index on stripeSessionId).
 // Env: STRIPE_SECRET_KEY (sk_test_... in test mode), AUTH_URL (the Next.js app, for the return links)
 let stripeClient;
-function stripe() {
-  stripeClient ??= new Stripe(process.env.STRIPE_SECRET_KEY);
-  return stripeClient;
-}
+const stripe = () => (stripeClient ??= new Stripe(process.env.STRIPE_SECRET_KEY));
 
 // Create the Stripe Checkout page: POST /subscription/checkout
 app.post("/subscription/checkout", authenticate, requireRole("vendor"), async (req, res) => {
@@ -581,7 +594,6 @@ app.post("/subscription/checkout", authenticate, requireRole("vendor"), async (r
   }
 
   const appUrl = new URL(process.env.AUTH_URL).origin;
-  const vendorId = req.user._id.toHexString();
 
   const session = await stripe().checkout.sessions.create({
     mode: "payment", // one payment = 30 days, it does not renew by itself
@@ -591,16 +603,12 @@ app.post("/subscription/checkout", authenticate, requireRole("vendor"), async (r
         price_data: {
           currency: "usd",
           unit_amount: Math.round(PREMIUM_PRICE * 100), // in cents
-          product_data: {
-            name: `PizzaHub Premium (${PREMIUM_DAYS} days)`,
-            description: "Unlimited active items, Premium vendor badge, featured placement",
-          },
+          product_data: { name: `PizzaHub Premium (${PREMIUM_DAYS} days)` },
         },
       },
     ],
     customer_email: req.user.email,
-    client_reference_id: vendorId,
-    metadata: { vendorId, plan: "premium" },
+    metadata: { vendorId: req.user._id.toHexString() }, // checked again in /confirm
     success_url: `${appUrl}/vendor/subscription?session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${appUrl}/vendor/subscription?cancelled=1`,
   });
@@ -616,16 +624,7 @@ app.post("/subscription/confirm", authenticate, requireRole("vendor"), async (re
     return res.status(400).json({ error: "Invalid sessionId" });
   }
 
-  // Already used? Then just report the current plan (refreshing the page is safe)
-  const done = await payments.findOne({ stripeSessionId: sessionId });
-  if (done) {
-    if (!done.vendorId.equals(req.user._id)) {
-      return res.status(403).json({ error: "This payment belongs to another vendor" });
-    }
-    return res.json({ plan: "premium", expiresAt: req.user.subscriptionExpiresAt, alreadyApplied: true });
-  }
-
-  // Ask Stripe (never trust the browser about a payment)
+  // Ask Stripe about the payment (never trust the browser)
   let session;
   try {
     session = await stripe().checkout.sessions.retrieve(sessionId, {
@@ -635,6 +634,7 @@ app.post("/subscription/confirm", authenticate, requireRole("vendor"), async (re
     return res.status(404).json({ error: "Stripe session not found" });
   }
 
+  // It must be this vendor's payment, and it must be paid
   if (session.metadata?.vendorId !== req.user._id.toHexString()) {
     return res.status(403).json({ error: "This payment belongs to another vendor" });
   }
@@ -642,18 +642,20 @@ app.post("/subscription/confirm", authenticate, requireRole("vendor"), async (re
     return res.status(402).json({ error: "The payment is not completed" });
   }
 
+  // Premium runs for 30 days (added to the current end date if still premium)
   const now = new Date();
   const start = isPremium(req.user) ? new Date(req.user.subscriptionExpiresAt) : now;
   const end = new Date(start.getTime() + PREMIUM_DAYS * 24 * 60 * 60 * 1000);
-  const charge = session.payment_intent?.latest_charge;
 
+  // Save the payment. The unique index on stripeSessionId stops the same
+  // payment from being used twice (page refresh, two requests at once).
   try {
     await payments.insertOne({
       vendorId: req.user._id,
       plan: "premium",
       amount: session.amount_total / 100,
       currency: session.currency,
-      cardLast4: charge?.payment_method_details?.card?.last4 ?? null,
+      cardLast4: session.payment_intent?.latest_charge?.payment_method_details?.card?.last4 ?? null,
       status: "paid",
       stripeSessionId: session.id,
       stripePaymentIntentId: session.payment_intent?.id ?? null,
@@ -662,9 +664,8 @@ app.post("/subscription/confirm", authenticate, requireRole("vendor"), async (re
       createdAt: now,
     });
   } catch (err) {
-    // Two requests at the same time: the unique index lets only one through
     if (err?.code === 11000) {
-      return res.json({ plan: "premium", alreadyApplied: true });
+      return res.json({ plan: "premium", expiresAt: req.user.subscriptionExpiresAt, alreadyApplied: true });
     }
     throw err;
   }
@@ -673,7 +674,6 @@ app.post("/subscription/confirm", authenticate, requireRole("vendor"), async (re
     { _id: req.user._id },
     { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: end, updatedAt: now } }
   );
-
   res.status(201).json({ plan: "premium", expiresAt: end });
 });
 
