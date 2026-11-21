@@ -894,6 +894,12 @@ app.get("/admin/transactions", authenticate, requireRole("admin"), async (req, r
 app.use(notFound);
 app.use(errorHandler);
 
-app.listen(PORT, () => {
-  console.log("server is running at " + PORT);
-});
+// On Vercel the platform runs the app, so we only listen on our own computer
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log("server is running at " + PORT);
+  });
+}
+
+// Vercel needs the app exported
+export default app;
