@@ -88,11 +88,16 @@ const toSlug = (text) => String(text).toLowerCase().trim().replace(/\s+/g, "-");
 // Customers only see approved items
 const publicItems = { status: "approved" };
 
-// Approved items with "vendorPremium": true when the vendor's premium plan is active.
-// featured = premium vendors first, then the best rated, 6 items.
-async function approvedItems({ featured = false } = {}) {
+// Approved items, with:
+//   vendorPremium : true when the vendor's premium plan is active
+//   vendorName    : the vendor's restaurant name (or name), null for old seed items
+// Options:
+//   match    : extra filters (search, category, location, price)
+//   sort     : sort order (default: as stored)
+//   featured : premium vendors first, then the best rated, 6 items
+async function approvedItems({ match = {}, sort = null, featured = false } = {}) {
   const pipeline = [
-    { $match: publicItems },
+    { $match: { ...publicItems, ...match } },
     { $lookup: { from: "user", localField: "vendorId", foreignField: "_id", as: "vendorUser" } },
     {
       $addFields: {
@@ -102,16 +107,86 @@ async function approvedItems({ featured = false } = {}) {
             { $gt: [{ $first: "$vendorUser.subscriptionExpiresAt" }, new Date()] },
           ],
         },
+        vendorName: {
+          $ifNull: [{ $first: "$vendorUser.businessName" }, { $first: "$vendorUser.name" }],
+        },
       },
     },
     { $project: { vendorUser: 0 } },
   ];
   if (featured) pipeline.push({ $sort: { vendorPremium: -1, rating: -1 } }, { $limit: 6 });
+  else if (sort) pipeline.push({ $sort: sort });
   return collection.aggregate(pipeline).toArray();
 }
 
 app.get("/", async (req, res) => {
   res.json(await approvedItems());
+});
+
+// Browse Menu with search, filters and sorting (all done by MongoDB)
+// GET /menu?search=pepperoni&category=classic-pizzas&location=Downtown
+//          &minPrice=5&maxPrice=20&sort=price_asc
+//   search   : part of the item name or description (case-insensitive)
+//   category : exact category slug
+//   location : exact location (area / city)
+//   minPrice / maxPrice : price range
+//   sort     : newest (default) | price_asc | price_desc | rating
+// Answer: { items, total, categories, locations }
+const sortOptions = {
+  newest: { createdAt: -1, _id: -1 },
+  price_asc: { price: 1, _id: 1 },
+  price_desc: { price: -1, _id: 1 },
+  rating: { rating: -1, _id: 1 },
+};
+
+// "Pepperoni (Large)" -> "Pepperoni \(Large\)" so user text is never treated as a regex
+const escapeRegex = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+app.get("/menu", async (req, res) => {
+  const search = String(req.query.search ?? "").trim();
+  const category = String(req.query.category ?? "").trim();
+  const location = String(req.query.location ?? "").trim();
+  const sort = String(req.query.sort ?? "newest");
+  const minPrice = req.query.minPrice === undefined || req.query.minPrice === "" ? null : Number(req.query.minPrice);
+  const maxPrice = req.query.maxPrice === undefined || req.query.maxPrice === "" ? null : Number(req.query.maxPrice);
+
+  // Check the query values
+  if (search.length > 60 || location.length > 60 || category.length > 60) {
+    return res.status(400).json({ error: "Search, category and location must be 60 characters or less" });
+  }
+  if (!sortOptions[sort]) {
+    return res.status(400).json({ error: `sort must be one of: ${Object.keys(sortOptions).join(", ")}` });
+  }
+  if ((minPrice !== null && !Number.isFinite(minPrice)) || (maxPrice !== null && !Number.isFinite(maxPrice))) {
+    return res.status(400).json({ error: "minPrice and maxPrice must be numbers" });
+  }
+
+  // Build the MongoDB filter
+  const match = {};
+  if (search) {
+    const pattern = new RegExp(escapeRegex(search), "i");
+    match.$or = [{ itemName: pattern }, { description: pattern }];
+  }
+  if (category) match.category = category;
+  if (location) match.location = location;
+  if (minPrice !== null || maxPrice !== null) {
+    match.price = {};
+    if (minPrice !== null) match.price.$gte = minPrice;
+    if (maxPrice !== null) match.price.$lte = maxPrice;
+  }
+
+  const [items, categories, locations] = await Promise.all([
+    approvedItems({ match, sort: sortOptions[sort] }),
+    collection.distinct("category", publicItems),
+    collection.distinct("location", publicItems),
+  ]);
+
+  res.json({
+    items,
+    total: items.length,
+    categories: categories.sort(),
+    locations: locations.filter(Boolean).sort(),
+  });
 });
 
 
