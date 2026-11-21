@@ -16,18 +16,30 @@ app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:3000", creden
 app.use(express.json());
 
 // MongoDB connect
-const client = new MongoClient(process.env.MONGODB_URI);
+// serverSelectionTimeoutMS: give up after 5 seconds (Vercel stops slow functions)
+const client = new MongoClient(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 5000 });
 
-
-export async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log("You successfully connected to MongoDB!");
-    return client;
-  } catch (err) {
-    console.dir(err);
-  }
+// Connects once and remembers it. If the connection fails, the next request
+// tries again (otherwise every query fails with "Topology is closed").
+let connecting;
+export function connectToMongoDB() {
+  connecting ??= client
+    .connect()
+    .then(() => console.log("You successfully connected to MongoDB!"))
+    .catch((err) => {
+      connecting = undefined; // allow a new try on the next request
+      console.error("MongoDB connection failed:", err.message);
+      throw err;
+    });
+  return connecting;
 }
+
+// Make sure we are connected before any route runs (needed on Vercel, where the
+// app wakes up on a request). A failure goes to the error handler.
+app.use(async (req, res, next) => {
+  await connectToMongoDB();
+  next();
+});
 
 const db = client.db("pizzaPulse");
 const collection = db.collection("menuItems");
@@ -43,18 +55,16 @@ const payments = db.collection("transactions");
 // After authenticate, req.user is the logged-in user (from the database).
 const { authenticate, requireRole } = createAuth(users);
 
-// Connect, then add indexes so the lists load fast
-connectToMongoDB().then(async () => {
-  try {
+// Indexes so the lists load fast (created in the background after connecting)
+connectToMongoDB()
+  .then(async () => {
     await orders.createIndex({ customerId: 1, createdAt: -1 });
     await orders.createIndex({ vendorId: 1, createdAt: -1 });
     await collection.createIndex({ vendorId: 1, createdAt: -1 });
     // one Stripe payment can give Premium only once
     await payments.createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true });
-  } catch (err) {
-    console.dir(err);
-  }
-});
+  })
+  .catch(() => {}); // already logged above
 
 // ---- Keys used in the collections ----
 // users      : name, email, image, role, isBlocked, businessName,
